@@ -1,0 +1,202 @@
+From b5128e2861ccb79551750bcf3df60dea3ae4982e Mon Sep 17 00:00:00 2001
+Message-Id: <mediacodec-memory-output@streamary.invalid>
+From: Streamary <noreply@streamary.invalid>
+Date: Sun, 4 Oct 2026 07:33:34 +0000
+Subject: [PATCH] mediacodec: decode to memory (no direct rendering), find
+ E-AC3/AC3 decoders
+
+Streamary decodes H.264, HEVC, AAC and E-AC3 with the device's MediaCodec decoders and takes the frames in memory
+(--no-mediacodec-dr, VLC's vmem output), not on an Android surface.
+
+- The module declines every other format, which stays with FFmpeg/mpg123 (formats with expired or no patents; the
+  MediaTek MPEG-2 decoder also failed on interlaced broadcast streams).
+
+- Video: without direct rendering, fmt_out.video is only filled from the decoder's first output format, so
+  MediaCodec was configured with 0x0 ("C2MtkVdec: BAD VALUE: Width 0 not supported" on a MediaTek phone) and VLC fell
+  back to FFmpeg. It is now configured with the input size, and the input size is kept for the ignore-size quirk.
+- Audio: the codec search compared profiles for any type with a profile, but converts only H.264 and HEVC profiles,
+  so E-AC3/AC3 streams (whose packetizer sets a profile) never found c2.dolby.eac3.decoder. The check is limited to
+  H.264 and HEVC.
+- The codec search names the decoder when Android has no capabilities for the type (it used to log only "Exception
+  occurred"), so a decoder that isn't offered to apps can be told apart from one that fails.
+- The decoder's output format ("output: ...") and "Decoder is draining" are logged as debug, not as errors.
+- H.264/HEVC without a picture size (a live TS before its first SPS) and AAC without its AudioSpecificConfig (ADTS in a
+  TS) open unstarted and drop the stream until the packetizer finds what is missing, which restarts the decoder (VLC's
+  "input format change"); FFmpeg used to open them meanwhile, and its decoders for these formats don't ship.
+
+(libvlcjni checks this line: Message-Id: <mediacodec-memory-output@streamary.invalid>)
+---
+ modules/codec/omxil/mediacodec.c     | 69 ++++++++++++++++++++++++----
+ modules/codec/omxil/mediacodec_jni.c |  9 +++-
+ 2 files changed, 67 insertions(+), 11 deletions(-)
+
+diff --git a/modules/codec/omxil/mediacodec.c b/modules/codec/omxil/mediacodec.c
+index 68e968eb8c..709b575ed8 100644
+--- a/modules/codec/omxil/mediacodec.c
++++ b/modules/codec/omxil/mediacodec.c
+@@ -491,8 +491,21 @@ static int StartMediaCodec(decoder_t *p_dec)
+ 
+     if (p_dec->fmt_in.i_cat == VIDEO_ES)
+     {
+-        args.video.i_width = p_dec->fmt_out.video.i_width;
+-        args.video.i_height = p_dec->fmt_out.video.i_height;
++        /* Without direct rendering, fmt_out is only filled from the first
++         * output format: configure with the input size (OpenDecoder refuses a
++         * video ES without one), not 0x0, which decoders refuse. */
++        args.video.i_width = p_dec->fmt_out.video.i_width
++                           ? p_dec->fmt_out.video.i_width : p_dec->fmt_in.video.i_width;
++        args.video.i_height = p_dec->fmt_out.video.i_height
++                            ? p_dec->fmt_out.video.i_height : p_dec->fmt_in.video.i_height;
++        if (!args.video.i_width || !args.video.i_height)
++        {
++            /* No size from the demuxer: the one from the stream's SPS. */
++            args.video.i_width = p_sys->video.i_input_width;
++            args.video.i_height = p_sys->video.i_input_height;
++        }
++        if (!args.video.i_width || !args.video.i_height)
++            return VLC_ENOOBJ; /* started when the first SPS arrives */
+         args.video.i_angle = p_sys->video.i_angle;
+ 
+         args.video.p_surface = p_sys->video.p_surface;
+@@ -593,12 +606,33 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
+     if (var_Type(p_dec, "mediacodec-failed") != 0)
+         return VLC_EGENERIC;
+ 
++    /* Streamary: only the formats whose patents are still in force go to the
++     * device's decoders; the others stay with FFmpeg/mpg123 (the device's
++     * MPEG-2 decoders also failed on interlaced broadcast streams). */
++    switch (p_dec->fmt_in.i_codec)
++    {
++        case VLC_CODEC_H264:
++        case VLC_CODEC_HEVC:
++        case VLC_CODEC_MP4A:
++        case VLC_CODEC_EAC3:
++            break;
++        default:
++            return VLC_EGENERIC;
++    }
++
+     if (p_dec->fmt_in.i_cat == VIDEO_ES)
+     {
+         /* Not all mediacodec versions can handle a size of 0. Hopefully, the
+          * packetizer will trigger a decoder restart when a new video size is
+-         * found. */
+-        if (!p_dec->fmt_in.video.i_width || !p_dec->fmt_in.video.i_height)
++         * found.
++         * Streamary: without direct rendering, H.264 and HEVC open without a
++         * size (a live TS has none until the first SPS) and start once the
++         * first SPS gives it (StartMediaCodec returns VLC_ENOOBJ until then);
++         * there is no software decoder to open them meanwhile. */
++        if ((!p_dec->fmt_in.video.i_width || !p_dec->fmt_in.video.i_height)
++         && (var_InheritBool(p_dec, CFG_PREFIX "dr")
++          || (p_dec->fmt_in.i_codec != VLC_CODEC_H264
++           && p_dec->fmt_in.i_codec != VLC_CODEC_HEVC)))
+             return VLC_EGENERIC;
+ 
+         switch (p_dec->fmt_in.i_codec) {
+@@ -773,6 +807,12 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
+                 goto bailout;
+             }
+         }
++        else
++        {
++            /* Used when the decoder's own size is ignored (quirk). */
++            p_sys->video.i_input_width = p_dec->fmt_in.video.i_width;
++            p_sys->video.i_input_height = p_dec->fmt_in.video.i_height;
++        }
+     }
+     else
+     {
+@@ -791,6 +831,8 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
+         p_dec->fmt_out.audio = p_dec->fmt_in.audio;
+     }
+ 
++    bool b_wait_csd = false;
++
+     /* Try first to configure CSD */
+     if (ParseExtra(p_dec) != VLC_SUCCESS)
+         goto bailout;
+@@ -803,6 +845,13 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
+         case VLC_CODEC_H264:
+         case VLC_CODEC_HEVC:
+             break; /* CSDs will come from hxxx_helper */
++        case VLC_CODEC_MP4A:
++            /* Streamary: AAC in a TS has no AudioSpecificConfig until the
++             * packetizer builds one, which restarts this decoder (input
++             * format change); there is no software decoder to open it
++             * meanwhile, so wait unstarted (blocks are dropped). */
++            b_wait_csd = true;
++            break;
+         default:
+             msg_Warn(p_dec, "Not CSD found for %4.4s",
+                      (const char *) &p_dec->fmt_in.i_codec);
+@@ -810,8 +859,10 @@ static int OpenDecoder(vlc_object_t *p_this, pf_MediaCodecApi_init pf_init)
+         }
+     }
+ 
+-    i_ret = StartMediaCodec(p_dec);
+-    if (i_ret != VLC_SUCCESS)
++    i_ret = b_wait_csd ? VLC_ENOOBJ : StartMediaCodec(p_dec);
++    if (i_ret == VLC_ENOOBJ)
++        msg_Dbg(p_dec, "MediaCodec starts once the stream's parameters are known");
++    else if (i_ret != VLC_SUCCESS)
+     {
+         msg_Err(p_dec, "StartMediaCodec failed");
+         goto bailout;
+@@ -1042,7 +1093,7 @@ static int Video_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
+             return -1;
+         }
+ 
+-        msg_Err(p_dec, "output: %d %s, %dx%d stride %d %d, crop %d %d %d %d",
++        msg_Dbg(p_dec, "output: %d %s, %dx%d stride %d %d, crop %d %d %d %d",
+                 p_sys->video.i_pixel_format, name,
+                 p_out->conf.video.width, p_out->conf.video.height,
+                 p_out->conf.video.stride, p_out->conf.video.slice_height,
+@@ -1205,7 +1256,7 @@ static int Audio_ProcessOutput(decoder_t *p_dec, mc_api_out *p_out,
+             return -1;
+         }
+ 
+-        msg_Err(p_dec, "output: channel_count: %d, channel_mask: 0x%X, rate: %d",
++        msg_Dbg(p_dec, "output: channel_count: %d, channel_mask: 0x%X, rate: %d",
+                 p_out->conf.audio.channel_count, p_out->conf.audio.channel_mask,
+                 p_out->conf.audio.sample_rate);
+ 
+@@ -1535,7 +1586,7 @@ static int DecodeBlock(decoder_t *p_dec, block_t *p_in_block)
+     if (p_in_block == NULL)
+     {
+         /* No input block, decoder is draining */
+-        msg_Err(p_dec, "Decoder is draining");
++        msg_Dbg(p_dec, "Decoder is draining");
+ 
+         if (p_sys->b_output_ready)
+             QueueBlockLocked(p_dec, NULL, true);
+diff --git a/modules/codec/omxil/mediacodec_jni.c b/modules/codec/omxil/mediacodec_jni.c
+index a9721c18de..fb1073b30e 100644
+--- a/modules/codec/omxil/mediacodec_jni.c
++++ b/modules/codec/omxil/mediacodec_jni.c
+@@ -400,7 +400,8 @@ char* MediaCodec_GetName(vlc_object_t *p_obj, const char *psz_mime,
+                                                       jmime);
+         if (CHECK_EXCEPTION())
+         {
+-            msg_Warn(p_obj, "Exception occurred in MediaCodecInfo.getCapabilitiesForType");
++            msg_Dbg(p_obj, "%.*s: no %s capabilities (getCapabilitiesForType threw)",
++                    name_len, name_ptr, psz_mime);
+             goto loopclean;
+         }
+         else if (codec_capabilities)
+@@ -433,7 +434,11 @@ char* MediaCodec_GetName(vlc_object_t *p_obj, const char *psz_mime,
+                 /* The mime type is matching for this component. We
+                    now check if the capabilities of the codec is
+                    matching the video format. */
+-                if (profile > 0)
++                /* Only H.264 and HEVC profiles are converted from the
++                 * decoder's list below; for other types (E-AC3, AC3...) no
++                 * decoder ever matched a profile, so none was found. */
++                if (profile > 0 && (!strcmp(psz_mime, "video/avc")
++                                 || !strcmp(psz_mime, "video/hevc")))
+                 {
+                     /* This decoder doesn't expose its profiles and is high
+                      * profile capable */
+-- 
+2.47.3
+

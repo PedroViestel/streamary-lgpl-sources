@@ -1,0 +1,452 @@
+From 9e84fb646c6c2e66e3be0f0607835469e340dc29 Mon Sep 17 00:00:00 2001
+Message-Id: <mft-platform-decoders@streamary.invalid>
+From: Streamary <noreply@streamary.invalid>
+Date: Sat, 3 Oct 2026 22:30:00 +0200
+Subject: [PATCH] mft: decode H.264, HEVC, AAC and E-AC3 with Windows' decoders
+
+Streamary decodes the formats whose patents are still in force with Windows' own Media Foundation decoders and
+leaves every other format to FFmpeg/mpg123 (the module declines them without an error message).
+
+- H.264/HEVC from MP4/MKV: the avcC/hvcC parameter sets are sent in front of the first packet (and again after a
+  flush); before, Microsoft's H.264 decoder took every packet and never output a picture.
+- HEVC (MFVideoFormat_HEVC, the HEVC Video Extensions decoder). That decoder crashes in
+  MFT_MESSAGE_NOTIFY_BEGIN_STREAMING without MF_MT_FRAME_SIZE, so without a frame size (a live TS) the module opens
+  unconfigured and drops the stream until the packetizer finds the size and restarts the decoder. 10-bit streams come
+  out as P010.
+- E-AC3 (MFAudioFormat_Dolby_DDPlus).
+- Every ready output is taken after each input (one per input made frames late, and they were dropped).
+- A flush on seek (there was none).
+- Low-latency mode for H.264 and HEVC (VLC's start wait gives up on a decoder that holds many frames).
+- No decoder installed for a format (e.g. HEVC without the extension) is a warning, not an error.
+- The output planes are read with the decoder's own layout (MF_MT_DEFAULT_STRIDE, and MF_MT_FRAME_SIZE, which is
+  padded: 1088 lines for 1080p H.264, 192 for 180) instead of the visible size; before, the chroma of such frames sat
+  below their luma (colour bleeding at edges, garbage in the top rows).
+
+(libvlcjni checks this line: Message-Id: <mft-platform-decoders@streamary.invalid>)
+---
+ modules/codec/mft.c | 259 ++++++++++++++++++++++++++++++++++++++++----------
+ 1 file changed, 216 insertions(+), 43 deletions(-)
+
+diff --git a/modules/codec/mft.c b/modules/codec/mft.c
+index dc1bb92..9784f0e 100644
+--- a/modules/codec/mft.c
++++ b/modules/codec/mft.c
+@@ -111,9 +111,13 @@ struct decoder_sys_t
+     DWORD output_stream_id;
+     IMFSample *output_sample;
+     IMFMediaType *output_type;
++    bool layout_logged;
++    bool waiting_for_size; /* HEVC opened without a frame size: nothing set up yet */
+ 
+     /* H264 only. */
+     uint8_t nal_length_size;
++    bool sent_extra;
++    bool got_output;
+ };
+ 
+ static const int pi_channels_maps[9] =
+@@ -176,14 +180,12 @@ typedef struct
+  * We need this table since the FOURCC used for GUID is not the same
+  * as the FOURCC used by VLC, for instance h264 vs H264.
+  */
++/* Streamary: only the formats whose patents are still in force are decoded by Windows (H.264, HEVC, AAC, E-AC3);
++ * the others stay with FFmpeg/mpg123 (ai-plan/steps/25-platform-decoders.md). */
+ static const pair_format_guid video_format_table[] =
+ {
+     { VLC_CODEC_H264, &MFVideoFormat_H264 },
+-    { VLC_CODEC_MJPG, &MFVideoFormat_MJPG },
+-    { VLC_CODEC_WMV1, &MFVideoFormat_WMV1 },
+-    { VLC_CODEC_WMV2, &MFVideoFormat_WMV2 },
+-    { VLC_CODEC_WMV3, &MFVideoFormat_WMV3 },
+-    { VLC_CODEC_VC1,  &MFVideoFormat_WVC1 },
++    { VLC_CODEC_HEVC, &MFVideoFormat_HEVC },
+     { 0, NULL }
+ };
+ 
+@@ -196,12 +198,8 @@ DEFINE_GUID(MFAudioFormat_Dolby_AC3, 0xe06d802c, 0xdb46, 0x11cf, 0xb4, 0xd1, 0x0
+  */
+ static const pair_format_guid audio_format_table[] =
+ {
+-    { VLC_CODEC_MPGA, &MFAudioFormat_MPEG      },
+-    { VLC_CODEC_MP3,  &MFAudioFormat_MP3       },
+-    { VLC_CODEC_DTS,  &MFAudioFormat_DTS       },
+     { VLC_CODEC_MP4A, &MFAudioFormat_AAC       },
+-    { VLC_CODEC_WMA2, &MFAudioFormat_WMAudioV8 },
+-    { VLC_CODEC_A52,  &MFAudioFormat_Dolby_AC3 },
++    { VLC_CODEC_EAC3, &MFAudioFormat_Dolby_DDPlus },
+     { 0, NULL }
+ };
+ 
+@@ -569,7 +567,14 @@ static int ProcessInputStream(decoder_t *p_dec, DWORD stream_id, block_t *p_bloc
+     HRESULT hr;
+     IMFSample *input_sample = NULL;
+ 
+-    if (AllocateInputSample(p_dec, stream_id, &input_sample, p_block->i_buffer))
++    /* H.264/HEVC from MP4/MKV: the parameter sets (converted to Annex B in InitializeMFT) go in front of the
++     * first packet, and again after a flush. */
++    const bool is_avc_or_hevc = p_dec->fmt_in.i_codec == VLC_CODEC_H264 || p_dec->fmt_in.i_codec == VLC_CODEC_HEVC;
++    size_t prefix = 0;
++    if (is_avc_or_hevc && !p_sys->sent_extra && p_sys->nal_length_size)
++        prefix = p_dec->fmt_in.i_extra;
++
++    if (AllocateInputSample(p_dec, stream_id, &input_sample, prefix + p_block->i_buffer))
+         goto error;
+ 
+     IMFMediaBuffer *input_media_buffer = NULL;
+@@ -582,19 +587,23 @@ static int ProcessInputStream(decoder_t *p_dec, DWORD stream_id, block_t *p_bloc
+     if (FAILED(hr))
+         goto error;
+ 
+-    memcpy(buffer_start, p_block->p_buffer, p_block->i_buffer);
++    if (prefix)
++        memcpy(buffer_start, p_dec->fmt_in.p_extra, prefix);
++    memcpy(buffer_start + prefix, p_block->p_buffer, p_block->i_buffer);
+ 
+-    if (p_dec->fmt_in.i_codec == VLC_CODEC_H264)
++    if (p_dec->fmt_in.i_codec == VLC_CODEC_H264
++     || (p_dec->fmt_in.i_codec == VLC_CODEC_HEVC && p_sys->nal_length_size))
+     {
+-        /* in-place NAL to annex B conversion. */
+-        h264_AVC_to_AnnexB(buffer_start, p_block->i_buffer, p_sys->nal_length_size);
++        /* in-place NAL to annex B conversion (the same length-prefix layout for HEVC). */
++        h264_AVC_to_AnnexB(buffer_start + prefix, p_block->i_buffer, p_sys->nal_length_size);
+     }
++    p_sys->sent_extra = true;
+ 
+     hr = IMFMediaBuffer_Unlock(input_media_buffer);
+     if (FAILED(hr))
+         goto error;
+ 
+-    hr = IMFMediaBuffer_SetCurrentLength(input_media_buffer, p_block->i_buffer);
++    hr = IMFMediaBuffer_SetCurrentLength(input_media_buffer, prefix + p_block->i_buffer);
+     if (FAILED(hr))
+         goto error;
+ 
+@@ -624,30 +633,55 @@ error:
+ }
+ 
+ /* Copy a packed buffer (no padding) to a picture_t */
+-static void CopyPackedBufferToPicture(picture_t *p_pic, const uint8_t *p_src)
++/* Copies a decoded frame laid out the way Media Foundation documents it: each plane is src_pitch (scaled like the
++ * picture's planes) by src_lines (the output type's frame height, which the decoders pad, e.g. 1088 for 1080p) and the
++ * planes follow each other. The picture only takes the visible part. Reading the planes at the visible height instead
++ * put the chroma of 1080-line H.264 rows below its luma. */
++static void CopyPackedBufferToPicture(picture_t *p_pic, const uint8_t *p_src, size_t src_length,
++                                      unsigned src_pitch, unsigned src_lines)
+ {
++    const uint8_t *p_end = p_src + src_length;
++    const plane_t *p_luma = &p_pic->p[0];
++    if (src_pitch < (unsigned)p_luma->i_visible_pitch)
++        src_pitch = p_luma->i_visible_pitch;
++    if (src_lines < (unsigned)p_luma->i_visible_lines)
++        src_lines = p_luma->i_visible_lines;
++
+     for (int i = 0; i < p_pic->i_planes; ++i)
+     {
+-        uint8_t *p_dst = p_pic->p[i].p_pixels;
+-
+-        if (p_pic->p[i].i_visible_pitch == p_pic->p[i].i_pitch)
++        const plane_t *p_plane = &p_pic->p[i];
++        /* NV12/P010 chroma has the luma pitch; I420 chroma half of it. */
++        const size_t plane_pitch = (size_t)src_pitch * p_plane->i_visible_pitch / p_luma->i_visible_pitch;
++        const size_t plane_lines = ((size_t)src_lines * p_plane->i_visible_lines + p_luma->i_visible_lines - 1) / p_luma->i_visible_lines;
++        uint8_t *p_dst = p_plane->p_pixels;
++        for (int i_line = 0; i_line < p_plane->i_visible_lines; i_line++)
+         {
+-            /* Plane is packed, only one memcpy is needed. */
+-            uint32_t plane_size = p_pic->p[i].i_pitch * p_pic->p[i].i_visible_lines;
+-            memcpy(p_dst, p_src, plane_size);
+-            p_src += plane_size;
+-            continue;
+-        }
+-
+-        for (int i_line = 0; i_line < p_pic->p[i].i_visible_lines; i_line++)
+-        {
+-            memcpy(p_dst, p_src, p_pic->p[i].i_visible_pitch);
+-            p_src += p_pic->p[i].i_visible_pitch;
+-            p_dst += p_pic->p[i].i_pitch;
++            const uint8_t *p_line = p_src + (size_t)i_line * plane_pitch;
++            if (p_line + p_plane->i_visible_pitch > p_end)
++                return;
++            memcpy(p_dst, p_line, p_plane->i_visible_pitch);
++            p_dst += p_plane->i_pitch;
+         }
++        p_src += plane_pitch * plane_lines;
+     }
+ }
+ 
++/* The source layout of the decoder's output (see CopyPackedBufferToPicture); zero when the type doesn't say. */
++static void GetOutputLayout(decoder_t *p_dec, unsigned *pitch, unsigned *lines)
++{
++    decoder_sys_t *p_sys = p_dec->p_sys;
++    *pitch = 0;
++    *lines = 0;
++    if (!p_sys->output_type)
++        return;
++    UINT32 stride = 0;
++    if (SUCCEEDED(IMFMediaType_GetUINT32(p_sys->output_type, &MF_MT_DEFAULT_STRIDE, &stride)))
++        *pitch = (INT32)stride < 0 ? (unsigned)-(INT32)stride : stride;
++    UINT64 frame_size = 0;
++    if (SUCCEEDED(IMFMediaType_GetUINT64(p_sys->output_type, &MF_MT_FRAME_SIZE, &frame_size)))
++        *lines = (UINT32)frame_size;
++}
++
+ static int ProcessOutputStream(decoder_t *p_dec, DWORD stream_id)
+ {
+     decoder_sys_t *p_sys = p_dec->p_sys;
+@@ -657,8 +691,7 @@ static int ProcessOutputStream(decoder_t *p_dec, DWORD stream_id)
+ 
+     DWORD output_status = 0;
+     MFT_OUTPUT_DATA_BUFFER output_buffer = { stream_id, p_sys->output_sample, 0, NULL };
+-    hr = IMFTransform_ProcessOutput(p_sys->mft, 0, 1, &output_buffer, &output_status);
+-    if (output_buffer.pEvents)
++    hr = IMFTransform_ProcessOutput(p_sys->mft, 0, 1, &output_buffer, &output_status);    if (output_buffer.pEvents)
+         IMFCollection_Release(output_buffer.pEvents);
+     /* Use the returned sample since it can be provided by the MFT. */
+     IMFSample *output_sample = output_buffer.pSample;
+@@ -714,12 +747,23 @@ static int ProcessOutputStream(decoder_t *p_dec, DWORD stream_id)
+         hr = IMFSample_GetBufferByIndex(output_sample, 0, &output_media_buffer);
+ 
+         BYTE *buffer_start;
+-        hr = IMFMediaBuffer_Lock(output_media_buffer, &buffer_start, NULL, NULL);
++        DWORD buffer_length = 0;
++        hr = IMFMediaBuffer_Lock(output_media_buffer, &buffer_start, NULL, &buffer_length);
+         if (FAILED(hr))
+             goto error;
+ 
+         if (p_dec->fmt_in.i_cat == VIDEO_ES)
+-            CopyPackedBufferToPicture(picture, buffer_start);
++        {
++            unsigned src_pitch, src_lines;
++            GetOutputLayout(p_dec, &src_pitch, &src_lines);
++            if (!p_sys->layout_logged)
++            {
++                msg_Dbg(p_dec, "output buffer %lu bytes, pitch %u, %u lines (picture %dx%d visible)", (unsigned long)buffer_length,
++                        src_pitch, src_lines, picture->p[0].i_visible_pitch, picture->p[0].i_visible_lines);
++                p_sys->layout_logged = true;
++            }
++            CopyPackedBufferToPicture(picture, buffer_start, buffer_length, src_pitch, src_lines);
++        }
+         else
+             memcpy(aout_buffer->p_buffer, buffer_start, total_length);
+ 
+@@ -754,6 +798,7 @@ static int ProcessOutputStream(decoder_t *p_dec, DWORD stream_id)
+         p_sys->output_sample = NULL;
+         if (AllocateOutputSample(p_dec, 0, &p_sys->output_sample))
+             goto error;
++        p_sys->got_output = true; /* ask again with the new type */
+         return VLC_SUCCESS;
+     }
+     else if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT)
+@@ -771,6 +816,7 @@ static int ProcessOutputStream(decoder_t *p_dec, DWORD stream_id)
+         decoder_QueueVideo(p_dec, picture);
+     else
+         decoder_QueueAudio(p_dec, aout_buffer);
++    p_sys->got_output = true;
+ 
+     return VLC_SUCCESS;
+ 
+@@ -796,13 +842,18 @@ static int DecodeSync(decoder_t *p_dec, block_t *p_block)
+         return VLCDEC_SUCCESS;
+     }
+ 
+-    /* Drain the output stream before sending the input packet. */
+-    if (ProcessOutputStream(p_dec, p_sys->output_stream_id))
+-        goto error;
+     if (ProcessInputStream(p_dec, p_sys->input_stream_id, p_block))
+         goto error;
+     block_Release(p_block);
+ 
++    /* Take every output the MFT has ready, not only one per input. */
++    do
++    {
++        p_sys->got_output = false;
++        if (ProcessOutputStream(p_dec, p_sys->output_stream_id))
++            return VLCDEC_SUCCESS;
++    } while (p_sys->got_output);
++
+     return VLCDEC_SUCCESS;
+ 
+ error:
+@@ -902,6 +953,73 @@ error:
+ 
+ static void DestroyMFT(decoder_t *p_dec);
+ 
++/* HEVC from MP4/MKV: the hvcC record's parameter sets (VPS/SPS/PPS) as Annex B, and the NAL length size used by
++ * the packets. NULL when it isn't an hvcC record (an Annex B stream, e.g. from MPEG-TS, has no conversion). */
++static uint8_t *hvcC_to_AnnexB(const uint8_t *p, size_t n, size_t *out_size, uint8_t *nal_length_size)
++{
++    if (n < 23 || p[0] != 1)
++        return NULL;
++
++    size_t total = 0;
++    for (int pass = 0; pass < 2; ++pass)
++    {
++        uint8_t *out = NULL;
++        if (pass == 1)
++        {
++            out = malloc(total);
++            if (!out)
++                return NULL;
++        }
++        size_t pos = 23, written = 0;
++        for (unsigned a = 0; a < p[22]; ++a)
++        {
++            if (pos + 3 > n)
++                goto bad;
++            unsigned count = (p[pos + 1] << 8) | p[pos + 2];
++            pos += 3;
++            for (unsigned i = 0; i < count; ++i)
++            {
++                if (pos + 2 > n)
++                    goto bad;
++                size_t len = (p[pos] << 8) | p[pos + 1];
++                pos += 2;
++                if (pos + len > n)
++                    goto bad;
++                if (out)
++                {
++                    static const uint8_t start_code[4] = { 0, 0, 0, 1 };
++                    memcpy(out + written, start_code, 4);
++                    memcpy(out + written + 4, p + pos, len);
++                }
++                written += 4 + len;
++                pos += len;
++            }
++        }
++        if (pass == 0)
++        {
++            if (written == 0)
++                return NULL;
++            total = written;
++            continue;
++        }
++        *out_size = written;
++        *nal_length_size = (p[21] & 3) + 1;
++        return out;
++bad:
++        free(out);
++        return NULL;
++    }
++    return NULL;
++}
++
++/* Seek: drop what the MFT holds; H.264 SPS/PPS go in again with the next packet. */
++static void Flush(decoder_t *p_dec)
++{
++    decoder_sys_t *p_sys = p_dec->p_sys;
++    IMFTransform_ProcessMessage(p_sys->mft, MFT_MESSAGE_COMMAND_FLUSH, 0);
++    p_sys->sent_extra = false;
++}
++
+ static int InitializeMFT(decoder_t *p_dec)
+ {
+     decoder_sys_t *p_sys = p_dec->p_sys;
+@@ -979,11 +1097,28 @@ static int InitializeMFT(decoder_t *p_dec)
+     if (FAILED(hr))
+         goto error;
+ 
+-    if (p_dec->fmt_in.i_codec == VLC_CODEC_H264)
+-    {
+-        /* It's not an error if the following call fails. */
++    /* Low-latency mode for H.264 and HEVC. Without it the decoders hold up to ~38 frames before the first output;
++     * VLC's start wait gives up ("buffer deadlock prevented"), the clock starts on the audio and every picture
++     * then arrives late and is dropped. With it they are slower (Microsoft's H.264 decoder: 1080p 7x, 4K 2x real
++     * time instead of 25x and 8x), which is still enough up to 4K at 30 fps. It's not an error if the call fails. */
++    if (attributes && (p_dec->fmt_in.i_codec == VLC_CODEC_H264 || p_dec->fmt_in.i_codec == VLC_CODEC_HEVC))
+         IMFAttributes_SetUINT32(attributes, &CODECAPI_AVLowLatencyMode, true);
+ 
++    if (p_dec->fmt_in.i_codec == VLC_CODEC_HEVC && p_dec->fmt_in.i_extra)
++    {
++        size_t i_buf;
++        uint8_t *buf = hvcC_to_AnnexB(p_dec->fmt_in.p_extra, p_dec->fmt_in.i_extra,
++                                      &i_buf, &p_sys->nal_length_size);
++        if (buf)
++        {
++            free(p_dec->fmt_in.p_extra);
++            p_dec->fmt_in.p_extra = buf;
++            p_dec->fmt_in.i_extra = i_buf;
++        }
++    }
++
++    if (p_dec->fmt_in.i_codec == VLC_CODEC_H264)
++    {
+         if (p_dec->fmt_in.i_extra)
+         {
+             if (h264_isavcC((uint8_t*)p_dec->fmt_in.p_extra, p_dec->fmt_in.i_extra))
+@@ -1115,11 +1250,41 @@ static int LoadMFTLibrary(MFHandle *mf)
+     return VLC_SUCCESS;
+ }
+ 
++static int DecodeWaitingForSize(decoder_t *p_dec, block_t *p_block)
++{
++    VLC_UNUSED(p_dec);
++    if (p_block)
++        block_Release(p_block);
++    return VLCDEC_SUCCESS;
++}
++
+ static int Open(vlc_object_t *p_this)
+ {
+     decoder_t *p_dec = (decoder_t *)p_this;
+     decoder_sys_t *p_sys;
+ 
++    /* Formats this module doesn't take go to the next decoder without an error message. */
++    if (!FormatToGUID(p_dec->fmt_in.i_cat == VIDEO_ES ? video_format_table : audio_format_table,
++                      p_dec->fmt_in.i_codec))
++        return VLC_EGENERIC;
++
++    /* Windows' HEVC decoder (HEVC Video Extensions) crashes in MFT_MESSAGE_NOTIFY_BEGIN_STREAMING when the input
++     * type has no frame size. */
++    /* So it opens unconfigured and drops the stream until the packetizer finds the size, which restarts this decoder
++     * ("input format change"): a live TS has no size at first, and no software HEVC decoder ships to open it. */
++    if (p_dec->fmt_in.i_codec == VLC_CODEC_HEVC
++     && (!p_dec->fmt_in.video.i_width || !p_dec->fmt_in.video.i_height))
++    {
++        msg_Dbg(p_dec, "HEVC size not known yet; waiting for it");
++        p_sys = p_dec->p_sys = calloc(1, sizeof(*p_sys));
++        if (!p_sys)
++            return VLC_ENOMEM;
++        p_sys->waiting_for_size = true;
++        p_dec->pf_decode = DecodeWaitingForSize;
++        p_dec->pf_flush = NULL;
++        return VLC_SUCCESS;
++    }
++
+     p_sys = p_dec->p_sys = calloc(1, sizeof(*p_sys));
+     if (!p_sys)
+         return VLC_ENOMEM;
+@@ -1138,7 +1303,8 @@ static int Open(vlc_object_t *p_this)
+ 
+     if (FindMFT(p_dec))
+     {
+-        msg_Err(p_dec, "Could not find suitable MFT decoder");
++        /* e.g. HEVC without Microsoft's HEVC Video Extensions, or a Windows N edition without Media Foundation */
++        msg_Warn(p_dec, "Could not find suitable MFT decoder");
+         goto error;
+     }
+ 
+@@ -1147,6 +1313,7 @@ static int Open(vlc_object_t *p_this)
+         goto error;
+ 
+     p_dec->pf_decode = p_sys->is_async ? DecodeAsync : DecodeSync;
++    p_dec->pf_flush = Flush;
+ 
+     return VLC_SUCCESS;
+ 
+@@ -1161,6 +1328,12 @@ static void Close(vlc_object_t *p_this)
+     decoder_sys_t *p_sys = p_dec->p_sys;
+     MFHandle *mf = &p_sys->mf_handle;
+ 
++    if (p_sys->waiting_for_size)
++    {
++        free(p_sys);
++        return;
++    }
++
+     DestroyMFT(p_dec);
+ 
+     if (mf->mfplat_dll)
+-- 
+2.46.0.windows.1
+
