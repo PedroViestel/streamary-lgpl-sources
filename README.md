@@ -20,7 +20,11 @@ Each [release](../../releases) of this repository names the Streamary versions i
 | `libvlcjni-<commit>.tar.gz` + diff | Android: VideoLAN's libvlcjni build system at the exact commit, and our change to it |
 | `SHA256SUMS` | checksums of all the above |
 
-**Release `libvlc-2026-10`** applies to Streamary 0.3 to 0.13 (and later versions until a newer release is listed):
+**Release `libvlc-2026-10b`** applies to the Windows version from Streamary 0.24 on (until a newer release is listed). It is the Windows build below with one more patch, `0004-mft-aac-configuration.patch` (Windows' AAC decoder gets the stream's configuration, so HE-AAC plays with sound); the VLC source, the image and the third-party archives are the same:
+
+- **Windows x64:** VLC 3.0.23 (commit `578d28f6c9f2379164516e689418f92ac74a3445`) with patches 0001, 0002 and 0004, built in VideoLAN's image `registry.videolan.org/vlc-debian-win64-3.0:20251208092116` (`sha256:ef9cab24b7f16cf223c0562b21f7a5f5f62294dcb88b0b704ef3d3c8682918f4`).
+
+**Release `libvlc-2026-10`** applies to the Windows version of Streamary 0.3 to 0.23, and to the Android version from 0.3 on (until a newer release is listed):
 
 - **Windows x64:** VLC 3.0.23 (commit `578d28f6c9f2379164516e689418f92ac74a3445`), built in VideoLAN's image `registry.videolan.org/vlc-debian-win64-3.0:20251208092116` (`sha256:ef9cab24b7f16cf223c0562b21f7a5f5f62294dcb88b0b704ef3d3c8682918f4`).
 - **Android (arm64-v8a, x86_64):** libvlcjni commit `0b8dc65efb203c86a0476bc337ddd99ecf1c0ef6` with VLC `3.0.24-37-gaec0d4b715` (commit `aec0d4b715e55a799a8618749a66744a492404e8`), built in VideoLAN's image `registry.videolan.org/vlc-debian-android:20260611225331` (`sha256:5f041ff50465aea803b93855d463f4b98f1d9f3be6628e304af2bf3fded6f98e`).
@@ -33,7 +37,7 @@ We keep every release here for at least three years after the last Streamary ver
 
 - `build-kit/build-win64.sh`: Windows x64 in VideoLAN's win64 image;
 - `build-kit/build-android.sh`: Android with libvlcjni in VideoLAN's Android image;
-- `build-kit/patches/`: our three patches (deinterlacing without yadif, Media Foundation platform decoders on Windows, MediaCodec output to memory on Android).
+- `build-kit/patches/`: our four patches (deinterlacing without yadif, Media Foundation platform decoders on Windows, MediaCodec output to memory on Android, the AAC configuration for Windows' decoder).
 
 The scripts expect the source archives above, or download the same versions themselves.
 

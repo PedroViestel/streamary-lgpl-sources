@@ -87,8 +87,14 @@ docker run --name vlclgpl-android -v vlclgpl-android:/build -v "<repo>/Tools/vlc
   memory-output mode (`--no-mediacodec-dr`, vmem): configured with the input picture size (it sent 0x0, which decoders
   refuse); limited to H.264, HEVC, AAC and E-AC3 (other formats stay with FFmpeg/mpg123); E-AC3/AC3 decoders found
   despite a stream profile; the codec search names a decoder Android has no capabilities for; the output format is
-  logged as debug, not as an error (step 25c). A fresh build applies 0001-0003 in order with `git am` (checked on
-  3.0.25 with libvlcjni's patches; 0002 touches only the Windows module).
+  logged as debug, not as an error (step 25c).
+- `0004-mft-aac-configuration.patch`: the Media Foundation decoder gives Windows' AAC decoder the stream's
+  AudioSpecificConfig (after the 12 HEAACWAVEINFO bytes, in `MF_MT_USER_DATA`). The decoder's own input type has no
+  configuration, so it took the declared rate as the core rate: HE-AAC from MP4/MKV (48 kHz over a 24 kHz core) came
+  out at 96 kHz and played cut, garbled or silent (2026-10-17; fixtures 11-13, `Tools/codec-probe/mfprobe` with
+  `MFPROBE_ASC`).
+  A fresh build applies 0001-0004 in order with `git am` (checked on 3.0.25 with libvlcjni's patches; 0002 and 0004
+  touch only the Windows module).
 
 ## Decoders (step 25)
 

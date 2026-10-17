@@ -1,0 +1,62 @@
+From 3ed17ace659c31a627d9749707d46d2c64d86fcb Mon Sep 17 00:00:00 2001
+Message-Id: <mft-aac-configuration@streamary.invalid>
+From: Streamary <noreply@streamary.invalid>
+Date: Sat, 17 Oct 2026 20:20:49 +0000
+Subject: [PATCH] mft: give Windows' AAC decoder the AudioSpecificConfig (HE-AAC)
+
+Windows' AAC decoder reads its configuration from MF_MT_USER_DATA: the HEAACWAVEINFO fields that follow its
+WAVEFORMATEX (12 bytes: payload type, profile and level, ...) and then the AudioSpecificConfig. The module took the
+decoder's own input type, whose user data is those 12 bytes without a configuration, and kept it ("do not overwrite
+existing user data"), so the stream's AudioSpecificConfig never reached the decoder. Without one the decoder takes the
+declared sample rate as the AAC core rate and doubles it when it finds SBR: HE-AAC from MP4/MKV, whose container gives
+the output rate (48 kHz over a 24 kHz core), came out at 96 kHz, switched mid-stream, and VLC played it cut, garbled
+or silent. AAC-LC and HE-AAC from ADTS (whose header gives the core rate) were right by luck.
+
+AAC now gets the 12 bytes (raw payload, profile not given) followed by the AudioSpecificConfig when there is one.
+Checked with Tools/codec-probe/mfprobe (Streamary): explicit (2B118800) and implicit (1310) HE-AAC configurations
+decode at 48 kHz with 2048 samples per frame whatever rate is declared; AAC-LC (1190) as before.
+
+(libvlcjni checks this line: Message-Id: <mft-aac-configuration@streamary.invalid>)
+---
+ modules/codec/mft.c | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/modules/codec/mft.c b/modules/codec/mft.c
+index 9784f0e..8ba96f9 100644
+--- a/modules/codec/mft.c
++++ b/modules/codec/mft.c
+@@ -312,7 +312,30 @@ static int SetInputType(decoder_t *p_dec, DWORD stream_id, IMFMediaType **result
+         }
+     }
+ 
+-    if (p_dec->fmt_in.i_extra > 0)
++    if (p_dec->fmt_in.i_codec == VLC_CODEC_MP4A)
++    {
++        /* Windows' AAC decoder reads its configuration from MF_MT_USER_DATA: the HEAACWAVEINFO fields after its
++         * WAVEFORMATEX (payload type, profile, ...; 12 bytes), then the AudioSpecificConfig. The decoder's own input
++         * type has those 12 bytes and no configuration, so it took the declared rate as the AAC core rate: HE-AAC
++         * (SBR) whose container gives the output rate (48 kHz over a 24 kHz core) came out at twice that rate, cut,
++         * garbled or silent. With the AudioSpecificConfig it decodes AAC-LC and HE-AAC (2048 samples per frame) at
++         * their real rate. Without one (raw frames from ADTS, whose header gave the core rate) it stays as it was. */
++        const size_t i_asc = p_dec->fmt_in.i_extra;
++        uint8_t *p_user_data = calloc(1, 12 + i_asc);
++        if (!p_user_data)
++            goto error;
++        p_user_data[0] = 0;    /* wPayloadType: raw AAC frames */
++        p_user_data[2] = 0xFE; /* wAudioProfileLevelIndication: not given (the configuration says it) */
++        if (i_asc)
++            memcpy(p_user_data + 12, p_dec->fmt_in.p_extra, i_asc);
++        hr = IMFMediaType_SetBlob(input_media_type, &MF_MT_USER_DATA, p_user_data, 12 + i_asc);
++        free(p_user_data);
++        if (FAILED(hr))
++            goto error;
++        msg_Dbg(p_dec, "AAC configuration: %zu bytes, %u Hz, %u channels declared", i_asc,
++                p_dec->fmt_in.audio.i_rate, p_dec->fmt_in.audio.i_channels);
++    }
++    else if (p_dec->fmt_in.i_extra > 0)
+     {
+         UINT32 blob_size = 0;
+         hr = IMFMediaType_GetBlobSize(input_media_type, &MF_MT_USER_DATA, &blob_size);
+-- 
+2.30.2
+
