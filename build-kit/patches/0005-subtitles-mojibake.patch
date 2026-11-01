@@ -1,0 +1,236 @@
+From 4705f3a579257d4a923e4bb140fb75fe406e246e Mon Sep 17 00:00:00 2001
+Message-Id: <subtitles-mojibake@streamary.invalid>
+From: Streamary <noreply@streamary.invalid>
+Date: Sun, 1 Nov 2026 14:00:00 +0000
+Subject: [PATCH] subtitles: repair text encoded to UTF-8 twice
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Many subtitle files (fansubs, rips) were read as Windows-1252 by the tool that made them and written back as UTF-8:
+"é" became "Ã©", "à" "Ã" plus a no-break space, "í" "Ã" plus an invisible soft hyphen. The text is valid UTF-8, so
+subsdec (SRT and other plain text) and libass (ASS/SSA, which takes UTF-8 as it comes) showed it as it is.
+
+modules/codec/mojibake.h turns such a text back when every character of it fits in one Windows-1252 byte (Latin-1 for
+the five positions 1252 leaves out) and those bytes are themselves valid UTF-8 with at least one multi-byte sequence.
+Correct Latin text fails that test (c-cedilla then a-tilde gives E7 E3, not UTF-8), and so does any text with a
+character outside Windows-1252 (CJK, music notes left intact), so those lines stay as they are. subsdec repairs after
+its charset conversion; libass repairs each event before ass_process_chunk.
+
+(libvlcjni checks this line: Message-Id: <subtitles-mojibake@streamary.invalid>)
+---
+ modules/codec/libass.c   |   5 ++
+ modules/codec/mojibake.h | 142 +++++++++++++++++++++++++++++++++++++++
+ modules/codec/subsdec.c  |  10 +++
+ 3 files changed, 157 insertions(+)
+ create mode 100644 modules/codec/mojibake.h
+
+diff --git a/modules/codec/libass.c b/modules/codec/libass.c
+index b8f0de4..3ee725a 100644
+--- a/modules/codec/libass.c
++++ b/modules/codec/libass.c
+@@ -43,6 +43,8 @@
+ 
+ #include <ass/ass.h>
+ 
++#include "mojibake.h"
++
+ #if LIBASS_VERSION < 0x01300000
+ # define ASS_FONTPROVIDER_AUTODETECT 1
+ #endif
+@@ -399,6 +401,9 @@ static int DecodeBlock( decoder_t *p_dec, block_t *p_block )
+     }
+     memcpy( p_spu_sys->p_subs_data, p_block->p_buffer,
+             p_block->i_buffer );
++    /* Text encoded to UTF-8 twice by the tool that made the file */
++    p_spu_sys->i_subs_len = vlc_mojibake_repair( p_spu_sys->p_subs_data,
++                                                 p_block->i_buffer );
+ 
+     p_spu->i_start = p_block->i_pts;
+     p_spu->i_stop = __MAX( p_sys->i_max_stop, p_block->i_pts + p_block->i_length );
+diff --git a/modules/codec/mojibake.h b/modules/codec/mojibake.h
+new file mode 100644
+index 0000000..edd8406
+--- /dev/null
++++ b/modules/codec/mojibake.h
+@@ -0,0 +1,142 @@
++/*****************************************************************************
++ * mojibake.h: repairs subtitle text that was encoded to UTF-8 twice
++ *****************************************************************************
++ * Copyright (C) 2026 Streamary
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU Lesser General Public License as published by
++ * the Free Software Foundation; either version 2.1 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
++ * GNU Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public License
++ * along with this program; if not, write to the Free Software Foundation,
++ * Inc., 51 Franklin Street, Fifth Floor, Boston MA 02110-1301, USA.
++ *****************************************************************************/
++
++#ifndef VLC_CODEC_MOJIBAKE_H
++#define VLC_CODEC_MOJIBAKE_H
++
++#include <stdbool.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++/* Many subtitle files were read as Windows-1252 by the tool that made them and
++ * written back as UTF-8, so e-acute (C3 A9) became A-tilde and the copyright sign
++ * (C3 83 C2 A9). The text is
++ * valid UTF-8 and every decoder shows it as it is. Such a text is turned back
++ * when every character of it fits in one Windows-1252 byte (or Latin-1 for the
++ * five positions 1252 leaves out) and those bytes are valid UTF-8 with at least
++ * one multi-byte sequence. Correct Latin text fails that test (c-cedilla
++ * then a-tilde gives E7 E3, not UTF-8), and so does any text with a character outside 1252. */
++
++static const uint16_t vlc_mojibake_cp1252_80[32] = {
++    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
++    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
++    0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
++    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
++};
++
++/* The Windows-1252 byte of a code point, or -1. */
++static inline int vlc_mojibake_byte(uint32_t cp)
++{
++    if (cp < 0x80 || (cp >= 0xA0 && cp <= 0xFF))
++        return (int)cp;
++    for (int i = 0; i < 32; i++)
++        if (vlc_mojibake_cp1252_80[i] == cp)
++            return 0x80 + i;
++    return -1;
++}
++
++/* Length of the valid UTF-8 sequence at p (n bytes left), or 0. */
++static inline size_t vlc_mojibake_utf8_len(const unsigned char *p, size_t n,
++                                           uint32_t *cp)
++{
++    unsigned char c = p[0];
++    size_t len;
++    uint32_t v, min;
++
++    if (c < 0x80) { *cp = c; return 1; }
++    if (c >= 0xC2 && c <= 0xDF) { len = 2; v = c & 0x1F; min = 0x80; }
++    else if (c >= 0xE0 && c <= 0xEF) { len = 3; v = c & 0x0F; min = 0x800; }
++    else if (c >= 0xF0 && c <= 0xF4) { len = 4; v = c & 0x07; min = 0x10000; }
++    else return 0;
++    if (n < len)
++        return 0;
++    for (size_t i = 1; i < len; i++)
++    {
++        if ((p[i] & 0xC0) != 0x80)
++            return 0;
++        v = (v << 6) | (p[i] & 0x3F);
++    }
++    if (v < min || v > 0x10FFFF || (v >= 0xD800 && v <= 0xDFFF))
++        return 0;
++    *cp = v;
++    return len;
++}
++
++/* Repairs the n bytes at buf in place; returns the new length (n if unchanged). */
++static inline size_t vlc_mojibake_repair(char *buf, size_t n)
++{
++    const unsigned char *in = (const unsigned char *)buf;
++    unsigned char *out;
++    size_t i = 0, o = 0;
++    bool b_multi = false;
++
++    /* Quick test: a lead byte of a 2-byte UTF-8 sequence read as 1252 gives
++     * U+00C2..U+00DF (C3 82..C3 9F), of a 3-byte one U+00E0..U+00EF (C3 A0..
++     * C3 AF). Without one there is nothing to repair. */
++    for (i = 0; i + 1 < n; i++)
++        if (in[i] == 0xC3 && in[i + 1] >= 0x82 && in[i + 1] <= 0xAF)
++            break;
++    if (i + 1 >= n)
++        return n;
++
++    out = malloc(n);
++    if (out == NULL)
++        return n;
++
++    for (i = 0; i < n; )
++    {
++        uint32_t cp;
++        size_t len = vlc_mojibake_utf8_len(in + i, n - i, &cp);
++        int byte = len ? vlc_mojibake_byte(cp) : -1;
++        if (cp == 0 && len == 1)
++            break; /* a NUL ends the text */
++        if (byte < 0)
++            goto keep;
++        out[o++] = (unsigned char)byte;
++        i += len;
++    }
++
++    /* The bytes must be valid UTF-8 themselves. */
++    for (size_t j = 0; j < o; )
++    {
++        uint32_t cp;
++        size_t len = vlc_mojibake_utf8_len(out + j, o - j, &cp);
++        if (len == 0)
++            goto keep;
++        if (len > 1)
++            b_multi = true;
++        j += len;
++    }
++    if (!b_multi)
++        goto keep;
++
++    memcpy(buf, out, o);
++    if (o < n)
++        buf[o] = '\0';
++    free(out);
++    return o;
++
++keep:
++    free(out);
++    return n;
++}
++
++#endif
+diff --git a/modules/codec/subsdec.c b/modules/codec/subsdec.c
+index 11ecfcd..5f530fc 100644
+--- a/modules/codec/subsdec.c
++++ b/modules/codec/subsdec.c
+@@ -38,6 +38,7 @@
+ #include <vlc_common.h>
+ #include <vlc_plugin.h>
+ #include <vlc_codec.h>
++#include "mojibake.h"
+ #include <vlc_charset.h>
+ #include <vlc_xml.h>
+ 
+@@ -207,6 +208,7 @@ struct decoder_sys_t
+ 
+     vlc_iconv_t         iconv_handle;            /* handle to iconv instance */
+     bool                b_autodetect_utf8;
++    bool                b_repaired;          /* logged once */
+ };
+ 
+ 
+@@ -448,6 +450,14 @@ static subpicture_t *ParseText( decoder_t *p_dec, block_t *p_block )
+         }
+     }
+ 
++    /* Text encoded to UTF-8 twice by the tool that made the file */
++    size_t i_len = strlen( psz_subtitle );
++    if( vlc_mojibake_repair( psz_subtitle, i_len ) != i_len && !p_sys->b_repaired )
++    {
++        msg_Dbg( p_dec, "repairing subtitle text encoded to UTF-8 twice" );
++        p_sys->b_repaired = true;
++    }
++
+     /* Create the subpicture unit */
+     p_spu = decoder_NewSubpictureText( p_dec );
+     if( !p_spu )
+-- 
+2.46.0.windows.1
+

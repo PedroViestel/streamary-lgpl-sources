@@ -112,6 +112,20 @@ def main(args):
         'Ships on: all platforms',
         'Source: https://github.com/google/material-design-icons',
         "The player's icons are drawn from Material Symbols paths by Tools/MakePlayerIcons.py."]), '']
+    # The app's fonts (step 53a, the redesign).
+    out += ['-' * 78, '\n'.join([
+        'Manrope (Mikhail Sharanda and the Manrope Project Authors)',
+        'Licence: SIL Open Font License 1.1 (full text in OFL-1.1.txt)',
+        'Ships on: all platforms',
+        'Source: https://github.com/google/fonts/tree/main/ofl/manrope',
+        'Copyright 2018 The Manrope Project Authors (https://github.com/googlefonts/manrope).',
+        'Streamary ships the Medium, Bold and ExtraBold instances of the variable font (made with fontTools).']), '']
+    out += ['-' * 78, '\n'.join([
+        'Geist Mono (Vercel)',
+        'Licence: SIL Open Font License 1.1 (full text in OFL-1.1.txt)',
+        'Ships on: all platforms',
+        'Source: https://github.com/vercel/geist-font',
+        'Copyright 2024 The Geist Project Authors (https://github.com/vercel/geist-font).']), '']
     out += ['=' * 78, 'Licence texts', '=' * 78, '']
     for name, text in sorted(shared.values()):
         out += ['-' * 78, name, '', text, '']

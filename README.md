@@ -20,11 +20,16 @@ Each [release](../../releases) of this repository names the Streamary versions i
 | `libvlcjni-<commit>.tar.gz` + diff | Android: VideoLAN's libvlcjni build system at the exact commit, and our change to it |
 | `SHA256SUMS` | checksums of all the above |
 
-**Release `libvlc-2026-10b`** applies to the Windows version from Streamary 0.24 on (until a newer release is listed). It is the Windows build below with one more patch, `0004-mft-aac-configuration.patch` (Windows' AAC decoder gets the stream's configuration, so HE-AAC plays with sound); the VLC source, the image and the third-party archives are the same:
+**Release `libvlc-2026-11`** applies to Streamary from 0.28 on, Windows and Android (until a newer release is listed). It adds patch `0005-subtitles-mojibake.patch` (subtitle text that was encoded to UTF-8 twice, such as "Ã©" for "é", is shown correctly); the third-party archives are byte-identical to those in `libvlc-2026-10`, so they are not repeated here:
+
+- **Windows x64:** VLC 3.0.23 (commit `578d28f6c9f2379164516e689418f92ac74a3445`) with patches 0001, 0002, 0004 and 0005 (`vlc-3.0.23-win64-local-changes.diff`; only the subtitle plugins were rebuilt), built in VideoLAN's image `registry.videolan.org/vlc-debian-win64-3.0:20251208092116` (`sha256:ef9cab24b7f16cf223c0562b21f7a5f5f62294dcb88b0b704ef3d3c8682918f4`).
+- **Android (arm64-v8a, x86_64):** libvlcjni commit `0b8dc65efb203c86a0476bc337ddd99ecf1c0ef6` with VLC `3.0.24-40-g0b7a323ba3` (patches 0001-0005 as commits; 0002 and 0004 change only the Windows decoder, which Android doesn't build), built in VideoLAN's image `registry.videolan.org/vlc-debian-android:20260611225331` (`sha256:5f041ff50465aea803b93855d463f4b98f1d9f3be6628e304af2bf3fded6f98e`).
+
+**Release `libvlc-2026-10b`** applies to the Windows version of Streamary 0.24 to 0.27. It is the Windows build below with one more patch, `0004-mft-aac-configuration.patch` (Windows' AAC decoder gets the stream's configuration, so HE-AAC plays with sound); the VLC source, the image and the third-party archives are the same:
 
 - **Windows x64:** VLC 3.0.23 (commit `578d28f6c9f2379164516e689418f92ac74a3445`) with patches 0001, 0002 and 0004, built in VideoLAN's image `registry.videolan.org/vlc-debian-win64-3.0:20251208092116` (`sha256:ef9cab24b7f16cf223c0562b21f7a5f5f62294dcb88b0b704ef3d3c8682918f4`).
 
-**Release `libvlc-2026-10`** applies to the Windows version of Streamary 0.3 to 0.23, and to the Android version from 0.3 on (until a newer release is listed):
+**Release `libvlc-2026-10`** applies to the Windows version of Streamary 0.3 to 0.23, and to the Android version of 0.3 to 0.27:
 
 - **Windows x64:** VLC 3.0.23 (commit `578d28f6c9f2379164516e689418f92ac74a3445`), built in VideoLAN's image `registry.videolan.org/vlc-debian-win64-3.0:20251208092116` (`sha256:ef9cab24b7f16cf223c0562b21f7a5f5f62294dcb88b0b704ef3d3c8682918f4`).
 - **Android (arm64-v8a, x86_64):** libvlcjni commit `0b8dc65efb203c86a0476bc337ddd99ecf1c0ef6` with VLC `3.0.24-37-gaec0d4b715` (commit `aec0d4b715e55a799a8618749a66744a492404e8`), built in VideoLAN's image `registry.videolan.org/vlc-debian-android:20260611225331` (`sha256:5f041ff50465aea803b93855d463f4b98f1d9f3be6628e304af2bf3fded6f98e`).
@@ -37,7 +42,7 @@ We keep every release here for at least three years after the last Streamary ver
 
 - `build-kit/build-win64.sh`: Windows x64 in VideoLAN's win64 image;
 - `build-kit/build-android.sh`: Android with libvlcjni in VideoLAN's Android image;
-- `build-kit/patches/`: our four patches (deinterlacing without yadif, Media Foundation platform decoders on Windows, MediaCodec output to memory on Android, the AAC configuration for Windows' decoder).
+- `build-kit/patches/`: our five patches (deinterlacing without yadif, Media Foundation platform decoders on Windows, MediaCodec output to memory on Android, the AAC configuration for Windows' decoder, subtitles encoded to UTF-8 twice).
 
 The scripts expect the source archives above, or download the same versions themselves.
 

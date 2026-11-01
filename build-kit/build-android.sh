@@ -31,6 +31,15 @@ done
 if [ ! -d vlc ]; then
     ./buildsystem/get-vlc.sh
 fi
+# A patch added after the checkout was made (get-vlc.sh runs once) goes on top with git am, in order, as a fresh
+# checkout would have it (the Windows-only ones too: they change modules Android doesn't build).
+for patch in /src/patches/*.patch; do
+    tr -d '\r' < "$patch" > /tmp/patch.patch
+    if ! git -C vlc apply --reverse --check /tmp/patch.patch 2>/dev/null; then
+        echo "applying: $patch"
+        git -C vlc -c user.name=Streamary -c user.email=noreply@streamary.invalid am /tmp/patch.patch
+    fi
+done
 (cd vlc && git log --oneline -3)
 
 # Codec patents (ai-plan/CONTEXT.md, 2026-10-03; step 25d): H.264, HEVC, AAC and E-AC3 are decoded by the platform

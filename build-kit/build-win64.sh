@@ -26,7 +26,8 @@ git describe --tags --exact-match
 
 # Our patches to VLC (Tools/vlc-lgpl/patches), each applied once.
 for patch in /src/patches/*.patch; do
-    if git apply --reverse --check "$patch" 2>/dev/null; then echo "already applied: $patch"; else git apply "$patch"; fi
+    tr -d '\r' < "$patch" > /tmp/patch.patch  # a Windows checkout may have CRLF
+    if git apply --reverse --check /tmp/patch.patch 2>/dev/null; then echo "already applied: $patch"; else git apply /tmp/patch.patch; fi
 done
 
 sed -i 's/--enable-dvdread //' extras/package/win32/build.sh

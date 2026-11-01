@@ -93,8 +93,14 @@ docker run --name vlclgpl-android -v vlclgpl-android:/build -v "<repo>/Tools/vlc
   configuration, so it took the declared rate as the core rate: HE-AAC from MP4/MKV (48 kHz over a 24 kHz core) came
   out at 96 kHz and played cut, garbled or silent (2026-10-17; fixtures 11-13, `Tools/codec-probe/mfprobe` with
   `MFPROBE_ASC`).
-  A fresh build applies 0001-0004 in order with `git am` (checked on 3.0.25 with libvlcjni's patches; 0002 and 0004
-  touch only the Windows module).
+- `0005-subtitles-mojibake.patch`: subtitle text that the tool which made the file encoded to UTF-8 twice ("Ã©"
+  for "é", common in fansubs and rips) is turned back, in subsdec (SRT and other plain text) and libass (ASS/SSA)
+  (`modules/codec/mojibake.h`). A line is changed only when every character fits in one Windows-1252 byte and those
+  bytes are valid UTF-8 with a multi-byte sequence, so correct Latin text, CJK and lines with other characters stay
+  as they are.
+  A fresh build applies 0001-0005 in order with `git am` (checked on 3.0.25 with libvlcjni's patches; 0002 and 0004
+  touch only the Windows module). A patch added later goes on top of an existing checkout: both scripts apply each
+  patch that isn't there yet (after stripping CR, which a Windows checkout adds).
 
 ## Decoders (step 25)
 
